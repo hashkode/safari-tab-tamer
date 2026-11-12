@@ -1,0 +1,11 @@
+.DS_Store
+/dist/
+*.scpt
+*.scptd/
+__pycache__/
+*.pyc
+# Never commit local Safari URL backups.
+/Backups/
+/backups/
+Safari-tabs-*.json
+Safari-tabs-*.tsv
