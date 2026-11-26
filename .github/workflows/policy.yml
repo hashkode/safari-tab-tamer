@@ -1,0 +1,145 @@
+name: Policy
+
+# The merge discipline GitHub has no setting for: the PR title, rebase,
+# checklist and attribution checks and the action pins. Its job `policy` is
+# one of the two checks the default-branch ruleset requires; the other is
+# code.yml's `code`. It runs on every PR
+# event that can change what it checks, edits included, and never runs the
+# code checks, so an edit costs one short job and leaves `code` as its last
+# real run reported it.
+on:
+  push:
+    branches: [main]
+  # No branch filter: layers of a stacked PR target each other, not main, and
+  # still need the check. No path filters either: a required check that does
+  # not run blocks the PR forever.
+  pull_request:
+    # `edited` re-runs it when the PR title or body changes;
+    # `ready_for_review` re-runs the checklist step skipped while drafting.
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  merge_group:
+  workflow_dispatch:
+
+# A newer event on the same PR cancels the older run, so the check reports
+# the PR as it is now. Runs on main always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Steps are conditional, the job is not: a required check that is skipped
+  # reports success without having checked anything.
+  policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # pull-requests: read lets the attribution check list the PR's commits.
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      # fetch-depth 0 brings every branch, the PR's base included, so the
+      # rebase check needs no token after checkout.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: PR title is a Conventional Commit
+        if: github.event_name == 'pull_request'
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          # The PR title becomes the squash commit subject.
+          pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: .+'
+          if ! printf '%s' "$TITLE" | grep -qE "$pattern"; then
+            echo "::error::PR title is not a Conventional Commit: '$TITLE'"
+            exit 1
+          fi
+          echo "ok: $TITLE"
+
+      - name: Branch was rebased, not merged into
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          merges="$(git log --merges --oneline "origin/$BASE_REF..$HEAD_SHA")"
+          if [ -n "$merges" ]; then
+            echo "::error::This branch contains merge commits from its base:"
+            echo "$merges"
+            echo "Use: git fetch origin && git rebase origin/$BASE_REF && git push --force-with-lease"
+            exit 1
+          fi
+          echo "ok: no merge commits between origin/$BASE_REF and $HEAD_SHA"
+
+      - name: Definition of done is complete
+        # Drafts may carry open boxes; bots do not use the template.
+        if: >-
+          github.event_name == 'pull_request'
+          && github.event.pull_request.draft == false
+          && github.event.pull_request.user.type != 'Bot'
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # Fenced code blocks are blanked first so a quoted checklist does not count.
+          unticked="$(printf '%s' "$BODY" \
+            | awk '/^[[:space:]]*```/ { f = !f; print ""; next } f { print ""; next } { print }' \
+            | grep -nE '^[[:space:]]*- \[ \]' || true)"
+          if [ -n "$unticked" ]; then
+            echo "::error::Unticked checkboxes remain in the PR description:"
+            echo "$unticked"
+            exit 1
+          fi
+          echo "ok: no unticked checkboxes"
+
+      - name: No tool or model attribution
+        # Owner rule: no AI co-author trailer and no "Generated with" line.
+        # A branch commit's trailer or the PR body can reach main through the
+        # squash. Commits come from the API, so checkout depth does not matter.
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          tools='claude|anthropic|copilot|openai|chatgpt|codex|gemini|cursor|aider|windsurf|devin'
+          pattern="^[[:space:]]*(co-authored-by:.*($tools)|.*generated (with|by) \\[?($tools))"
+          # Captured first, so a failed API call fails the step instead of
+          # leaving nothing to check.
+          commits="$(gh api --paginate "repos/$REPO/pulls/$PR/commits" \
+            --jq '.[] | "\(.sha[0:7])\t\(.commit.message | @base64)"')"
+          hits=""
+          while IFS=$'\t' read -r sha msg; do
+            [ -n "$sha" ] || continue
+            m="$(printf '%s' "$msg" | base64 -d | grep -inE "$pattern" || true)"
+            if [ -n "$m" ]; then hits="${hits}commit ${sha}: ${m}"$'\n'; fi
+          done <<< "$commits"
+          # Fenced code blocks are blanked so a quoted example does not count.
+          b="$(printf '%s' "$BODY" \
+            | awk '/^[[:space:]]*```/ { f = !f; print ""; next } f { print ""; next } { print }' \
+            | grep -inE "$pattern" || true)"
+          if [ -n "$b" ]; then hits="${hits}PR body: ${b}"$'\n'; fi
+          if [ -n "$hits" ]; then
+            echo "::error::Tool or model attribution found:"
+            printf '%s' "$hits"
+            echo "Reword the commits (git rebase -i, then git push --force-with-lease) and edit the PR body."
+            exit 1
+          fi
+          echo "ok: no tool or model attribution"
+
+      - name: Actions are pinned to a full commit SHA
+        run: |
+          unpinned="$(grep -rnE '^[[:space:]]*(-[[:space:]]+)?uses:' .github/workflows \
+            | grep -vE 'uses:[[:space:]]*\./' \
+            | grep -vE '@[0-9a-f]{40}([[:space:]]|$)' || true)"
+          if [ -n "$unpinned" ]; then
+            echo "::error::Actions must be pinned to a 40-character commit SHA:"
+            echo "$unpinned"
+            exit 1
+          fi
+          echo "ok: every uses: is SHA-pinned"
+

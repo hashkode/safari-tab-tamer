@@ -1,0 +1,64 @@
+name: Code
+
+# Every check of the code in one job, `code`, one of the two checks the
+# default-branch ruleset requires; the other is policy.yml's `policy`. It runs
+# when the code may have changed: a push to main, a PR opened, reopened or its
+# head moved, a merge group, by hand. An edit of the PR's title or body does
+# not start it, so the `code` check of the head commit stays the one its last
+# real run reported; a skipped job would report success in its place.
+on:
+  push:
+    branches: [main]
+  # No branch filter: layers of a stacked PR target each other, not main, and
+  # still need the check. No path filters either: a required check that does
+  # not run blocks the PR forever.
+  pull_request:
+    types: [opened, synchronize, reopened]
+  merge_group:
+  workflow_dispatch:
+
+# A newer push to the same PR cancels the older run. Runs on main always
+# finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # One job on macOS: the script compiles and runs only there (osacompile,
+  # osascript). The secret scan runs first; it needs nothing else. The step
+  # names say which check failed.
+  code:
+    runs-on: macos-15
+    timeout-minutes: 15
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks (checksum-verified)
+        run: |
+          archive="gitleaks_${GITLEAKS_VERSION}_darwin_arm64.tar.gz"
+          curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$archive" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
+      - name: Secret scan (full history)
+        run: '"$RUNNER_TEMP/gitleaks" git --no-banner --redact --verbose .'
+      - name: Compile and run pure fixtures
+        run: make check
+      - name: Build
+        run: make build
+      - name: Build leaves the tree clean
+        run: |
+          dirty="$(git status --porcelain)"
+          if [ -n "$dirty" ]; then
+            echo "::error::The build modified tracked or unignored files:"
+            echo "$dirty"
+            exit 1
+          fi
