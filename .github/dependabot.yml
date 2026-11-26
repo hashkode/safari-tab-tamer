@@ -1,0 +1,21 @@
+version: 2
+
+# Weekly, at most five open pull requests. Minor and patch updates travel in one group; a major update matches
+# no group, so Dependabot opens it as its own pull request, to be read on its own.
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    # Supply chain: no version younger than 3 days; security updates are not held back.
+    cooldown:
+      default-days: 3
+    # Titles read `ci(deps): …`, distinguishable from hand-written CI changes in a generated changelog.
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
